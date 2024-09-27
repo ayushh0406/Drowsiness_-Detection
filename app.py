@@ -1,127 +1,96 @@
 import cv2
 import dlib
-import pyttsx3
-import os
-import time
+import numpy as np
 import streamlit as st
+from streamlit_webrtc import webrtc_streamer, VideoTransformerBase, RTCConfiguration
 from collections import deque
+import os
 
+# --- PATH CONFIGURATION ---
+# For Deployment: Ensure the .dat file is in your GitHub root folder
+SHAPE_PREDICTOR_PATH = "shape_predictor_68_face_landmarks.dat"
 
-# Manhattan Distance Calculation (L1 Distance)
+# --- MODEL LOADING ---
+@st.cache_resource
+def load_models():
+    detector = dlib.get_frontal_face_detector()
+    if not os.path.exists(SHAPE_PREDICTOR_PATH):
+        st.error(f"Model file not found! Please upload {SHAPE_PREDICTOR_PATH} to your GitHub.")
+        return None, None
+    predictor = dlib.shape_predictor(SHAPE_PREDICTOR_PATH)
+    return detector, predictor
+
+face_detector, landmark_predictor = load_models()
+
+# --- LOGIC FUNCTIONS ---
 def calculate_manhattan(eye):
+    # Optimized Manhattan Distance (L1) based on your original logic
     A = abs(eye[1][0] - eye[5][0]) + abs(eye[1][1] - eye[5][1])
     B = abs(eye[2][0] - eye[4][0]) + abs(eye[2][1] - eye[4][1])
     C = abs(eye[0][0] - eye[3][0]) + abs(eye[0][1] - eye[3][1])
-    ear = (A + B) / (2.0 * C)
-    return ear
+    return (A + B) / (2.0 * C)
 
-# Class to handle PERCLOS calculation
-class PERCLOS_Detector:
-    def __init__(self, window_size=30, eye_closed_threshold=0.25, perclos_threshold=0.8):
-        self.window_size = window_size
-        self.eye_closed_threshold = eye_closed_threshold
-        self.perclos_threshold = perclos_threshold
-        self.ear_window = deque(maxlen=window_size)
-        self.alert_triggered = False  # Flag to track if alert has been triggered
+class DrowsinessTransformer(VideoTransformerBase):
+    def __init__(self):
+        self.window_size = 20
+        self.eye_closed_threshold = 0.25
+        self.perclos_threshold = 0.7 # Slightly lowered for webcams
+        self.ear_window = deque(maxlen=self.window_size)
 
-    def update_ear(self, ear):
-        self.ear_window.append(ear)
-        if len(self.ear_window) == self.window_size:
-            perclos = self.calculate_perclos()
-            print(f'PERCLOS: {perclos * 100:.2f}%')
-            if perclos >= self.perclos_threshold:   
-                self.trigger_alert()
-            else:
-                self.alert_triggered = False  # Reset alert trigger when eyes are open
+    def transform(self, frame):
+        img = frame.to_ndarray(format="bgr24")
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        faces = face_detector(gray)
 
-    def calculate_perclos(self):
-        closed_eyes_count = sum(1 for ear in self.ear_window if ear < self.eye_closed_threshold)
-        return closed_eyes_count / len(self.ear_window)
+        status = "Active"
+        color = (0, 255, 0)
+        current_perclos = 0
 
-    def trigger_alert(self):
-        if not self.alert_triggered:  # Trigger alert only if it hasn't been triggered yet
-            print("Drowsiness Detected! Alert!")
-            engine.say("Alert! Wake up! You are feeling drowsy!")
-            engine.runAndWait()
-            self.alert_triggered = True  # Set alert as triggered
+        for face in faces:
+            landmarks = landmark_predictor(gray, face)
+            
+            # Extract eye coordinates
+            left_eye = [(landmarks.part(n).x, landmarks.part(n).y) for n in range(36, 42)]
+            right_eye = [(landmarks.part(n).x, landmarks.part(n).y) for n in range(42, 48)]
 
-# Initialize text-to-speech engine
-engine = pyttsx3.init()
+            # Calculate EAR
+            l_ear = calculate_manhattan(left_eye)
+            r_ear = calculate_manhattan(right_eye)
+            avg_ear = (l_ear + r_ear) / 2.0
 
-# Path to the shape predictor file
-shape_predictor_path = r"C:\Users\bhomi\OneDrive\Desktop\Projects\Drowsines Detection\shape_predictor_68_face_landmarks.dat\shape_predictor_68_face_landmarks.dat"
+            # PERCLOS Update
+            self.ear_window.append(avg_ear)
+            if len(self.ear_window) == self.window_size:
+                closed_count = sum(1 for e in self.ear_window if e < self.eye_closed_threshold)
+                current_perclos = closed_count / self.window_size
 
-# Check if the shape predictor file exists
-if not os.path.isfile(shape_predictor_path):
-    raise FileNotFoundError(f"Shape predictor file not found at {shape_predictor_path}. Please check the path.")
+            # Check Drowsiness
+            if current_perclos >= self.perclos_threshold:
+                status = "DROWSY ALERT!"
+                color = (0, 0, 255)
+            
+            # Draw eye landmarks
+            for (x, y) in left_eye + right_eye:
+                cv2.circle(img, (x, y), 1, (255, 255, 255), -1)
 
-# Load Dlib's face detector and landmark predictor
-try:
-    face_detector = dlib.get_frontal_face_detector()
-    landmark_predictor = dlib.shape_predictor(shape_predictor_path)
-except RuntimeError as e:
-    print(f"Failed to load the shape predictor. Error: {e}")
-    exit(1)
+        # UI Overlays
+        cv2.putText(img, f"Status: {status}", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
+        cv2.putText(img, f"PERCLOS: {current_perclos:.2%}", (20, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        
+        return img
 
-# Set up camera
-cap = cv2.VideoCapture(0)
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)  # Set width
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)  # Set height
+# --- STREAMLIT UI ---
+st.set_page_config(page_title="Drowsiness Detector", layout="wide")
+st.title("🚗 Real-Time Drowsiness Detection")
+st.write("Using Manhattan Distance (L1) and PERCLOS logic.")
 
-# Initialize PERCLOS detector
-perclos_detector = PERCLOS_Detector(window_size=30, eye_closed_threshold=0.25, perclos_threshold=0.8)
+RTC_CONFIGURATION = RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]})
 
-# Create a full-screen window
-cv2.namedWindow("PERCLOS Drowsiness Detector", cv2.WND_PROP_FULLSCREEN)
-cv2.setWindowProperty("PERCLOS Drowsiness Detector", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+webrtc_streamer(
+    key="drowsiness-det",
+    video_transformer_factory=DrowsinessTransformer,
+    rtc_configuration=RTC_CONFIGURATION,
+    media_stream_constraints={"video": True, "audio": False},
+)
 
-while True:
-    start_time = time.time()  # Record the start time
-
-    ret, frame = cap.read()
-    if not ret:
-        print("Failed to capture frame.")
-        break
-
-    gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    faces = face_detector(gray_frame)
-
-    for face in faces:
-        landmarks = landmark_predictor(gray_frame, face)
-
-        # Get coordinates of left and right eyes (36-41 for left, 42-47 for right)
-        left_eye = [(landmarks.part(n).x, landmarks.part(n).y) for n in range(36, 42)]
-        right_eye = [(landmarks.part(n).x, landmarks.part(n).y) for n in range(42, 48)]
-
-        # Calculate EAR using Manhattan distance for both eyes and take the average
-        left_ear = calculate_manhattan(left_eye)
-        right_ear = calculate_manhattan(right_eye)
-        average_ear = (left_ear + right_ear) / 2.0
-
-        # Update the PERCLOS detector with the new EAR value
-        perclos_detector.update_ear(average_ear)
-
-        # Draw the eye regions on the frame
-        for (x, y) in left_eye + right_eye:
-            cv2.circle(frame, (x, y), 2, (0, 255, 0), -1)
-
-        # Show alert text when drowsiness is detected
-        if perclos_detector.alert_triggered:
-            cv2.putText(frame, "Alert! Drowsiness Detected!", (50, 50), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 0, 255), 5, cv2.LINE_AA)
-
-    # Calculate time taken for processing and display timestamp
-    processing_time = time.time() - start_time
-    timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-    cv2.putText(frame, f"Time: {timestamp}", (10, 30), 
-                cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2, cv2.LINE_AA)
-    cv2.putText(frame, f"Processing Time: {processing_time:.2f}s", (10, 60), 
-                cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2, cv2.LINE_AA)
-
-    cv2.imshow("PERCLOS Drowsiness Detector", frame)
-
-    if cv2.waitKey(1) & 0xFF == 27:  # Press 'Esc' to exit
-        break
-
-cap.release()
-cv2.destroyAllWindows()
+st.sidebar.info("This system analyzes eye closure duration (PERCLOS) using 68-point facial landmarks.")
